@@ -89,7 +89,7 @@ def smoothCFS(cfs, scales, dt, ns, nt):
     for kk in range(0, cfs.shape[0]):
         F = np.exp(-nt * (normscales[kk] ** 2) * omega ** 2)
         smooth = np.fft.ifft(F * np.fft.fft(cfs[kk - 1], npad))
-        cfs[kk - 1] = smooth[0:N]
+        cfs[kk - 1] = np.real(smooth[0:N])
     # Convolve the coefficients with a moving average smoothing filter across scales.
     H = 1 / ns * np.ones((ns, 1))
 
@@ -211,23 +211,41 @@ def xwt(trace_ref, trace_current, fs, ns=3, nt=0.25, vpo=12, freqmin=0.1, freqma
     # scales are calculated using the wavelet Fourier wavelength
     # fft : Normalized fast Fourier transform of the input trace
     # fftfreqs : Fourier frequencies for the calculated FFT spectrum.
-    ###############################################################################################################
-    cwt_reference, scales, freqs, coi, fft, fftfreqs = wavelet.cwt(x_reference, dt, dj, s0, J, mother, freqs=freqlim)
-    cwt_current, _, _, _, _, _ = wavelet.cwt(x_current, dt, dj, s0, J, mother, freqs=freqlim)
-    ###############################################################################################################
+    try:
+        cwt_reference, scales, freqs, coi, fft, fftfreqs = wavelet.cwt(x_reference, dt, dj, s0, J, mother, freqs=freqlim)
+        cwt_current, _, _, _, _, _ = wavelet.cwt(x_current, dt, dj, s0, J, mother, freqs=freqlim)
+    except Exception as e:
+        logger.error(f"Error in wavelet transform: {str(e)}")
+        raise
 
     scales = np.array([[kk] for kk in scales])
     invscales = np.kron(np.ones((1, nx)), 1 / scales)
 
+    # Apply smoothing
     cfs2 = smoothCFS(invscales * abs(cwt_current) ** 2, scales, dt, ns, nt)
     cfs1 = smoothCFS(invscales * abs(cwt_reference) ** 2, scales, dt, ns, nt)
     crossCFS = cwt_reference * np.conj(cwt_current)
     WXamp = abs(crossCFS)
     # cross-wavelet transform operation with smoothing
     crossCFS = smoothCFS(invscales * crossCFS, scales, dt, ns, nt)
-    WXspec = crossCFS / (np.sqrt(cfs1) * np.sqrt(cfs2))
+
+    # Handle zeros to prevent divide-by-zero
+    mask1 = cfs1 > 0
+    mask2 = cfs2 > 0
+    valid_mask = mask1 & mask2  # Areas where both have power
+            
+    # Initialize with NaNs
+    WXspec = np.full_like(crossCFS, np.nan, dtype=complex)
+    Wcoh = np.full_like(crossCFS, np.nan)
+    
+    # Division operations
+    WXspec[valid_mask] = crossCFS[valid_mask] / (np.sqrt(cfs1[valid_mask]) * np.sqrt(cfs2[valid_mask]))
+    Wcoh[valid_mask] = abs(crossCFS[valid_mask]) ** 2 / (cfs1[valid_mask] * cfs2[valid_mask])
     WXangle = np.angle(WXspec)
-    Wcoh = abs(crossCFS) ** 2 / (cfs1 * cfs2)
+
+    # Clip coherence values to [0,1]
+    Wcoh = np.clip(Wcoh, 0.0, 1.0)
+    
     pp = 2 * np.pi * freqs
     pp2 = np.array([[kk] for kk in pp])
     WXdt = WXangle / np.kron(np.ones((1, nx)), pp2)
@@ -270,6 +288,8 @@ def compute_wct_dvv(freqs, tvec, WXamp, Wcoh, delta_t, lag_min=5, coda_cycles=20
     tuple
         dvv values (percentage), errors (percentage), and weighting function used.
     """   
+    import warnings
+    from scipy.optimize import OptimizeWarning
     inx = np.where((freqs >= freqmin) & (freqs <= freqmax))  # Filter frequencies within the specified range
     dvv, err = np.zeros(len(inx[0])), np.zeros(len(inx[0])) # Initialize dvv and err arrays
 
@@ -278,7 +298,10 @@ def compute_wct_dvv(freqs, tvec, WXamp, Wcoh, delta_t, lag_min=5, coda_cycles=20
     zero_idx = np.where((Wcoh < mincoh) | (delta_t > maxdt))
     wf = (weight_func + abs(np.nanmin(weight_func))) / weight_func.max()
     wf[zero_idx] = 0
-
+                
+    # Track frequencies error
+    problematic_freqs = []
+                
     # Loop through frequency indices for linear regression
     for ii, ifreq in enumerate(inx[0]):
         period = 1.0 / freqs[ifreq]
@@ -293,18 +316,23 @@ def compute_wct_dvv(freqs, tvec, WXamp, Wcoh, delta_t, lag_min=5, coda_cycles=20
 
             delta_t[ifreq][tindex] = np.nan_to_num(delta_t[ifreq][tindex])
             w = wf[ifreq]  # Weighting function for the specific frequency
-            w[~np.isfinite(w)] = 1.0
+            non_zero_mask = w > 0
 
             # Percentage of non-zero weights
-            nzc_perc = np.count_nonzero(w[tindex]) / len(tindex)
+            nzc_perc = np.count_nonzero(non_zero_mask[tindex]) / len(tindex)
             if nzc_perc >= min_nonzero:
+                with warnings.catch_warnings(record=True) as w_catcher:
+                    warnings.simplefilter("always", OptimizeWarning)
                 m, em = linear_regression(tvec[tindex], delta_t[ifreq][tindex], w[tindex], intercept_origin=True)
+                if any(issubclass(warning.category, OptimizeWarning) for warning in w_catcher):
+                        problematic_freqs.append(freqs[ifreq])
                 dvv[ii], err[ii] = -m, em
             else:
                 dvv[ii], err[ii] = np.nan, np.nan
         else:
             logger.debug('Not enough points to estimate dv/v for WCT')
-    
+    if problematic_freqs:
+        logger.warning(f"Covariance estimation issues between {min(problematic_freqs):.2f}-{max(problematic_freqs):.2f} Hz: Modify min_nonzero (current: {min_nonzero}), mincoh (current: {mincoh}), maxdt (current: {maxdt}) and/or coda_cycles (current: {coda_cycles})")
     return dvv * 100, err * 100, wf
 
 def get_avgcoh(freqs, tvec, wcoh, freqmin, freqmax, lag_min=5, coda_cycles=20):
@@ -337,153 +365,449 @@ def get_avgcoh(freqs, tvec, wcoh, freqmin, freqmax, lag_min=5, coda_cycles=20):
         tindex = np.where(((tvec >= -lag_max) & (tvec <= -lag_min)) | ((tvec >= lag_min) & (tvec <= lag_max)))[0] # Index of the coda
 
         if len(tvec)>2: # check time vector size
-            if not np.any(wcoh[ifreq]): # check non-empty dt array
+            if not np.any(wcoh[ifreq]) or wcoh[ifreq][tindex].size == 0: # check non-empty dt array
+                coh[ii] = np.nan
                 continue
-            c = np.nanmean(wcoh[ifreq][tindex])
+            c = np.nanmean(np.abs(wcoh[ifreq][tindex]))
             coh[ii] = c
 
         else:
-            logger.debug('not enough points to compute average coherence') #not sure why it would ever get here, but just in case.
+            logger.debug('Not enough points to compute average coherence') #not sure why it would ever get here, but just in case.
             coh[ii] = np.nan
 
     return coh
 
-def main(loglevel="INFO"):
+
+def save_day_wct_results(station1, station2, date, component, filterid, mov_stack, taxis, dvv, err, coh, freqs, inx):
+    """
+    Save the WCT results for a single day to a file in a hierarchical folder structure:
+    WCT/[filter_id]/[mov_stack]/[component]/[station_pair]/[date].npz
+    
+    Parameters:
+    ----------
+    station1, station2 : str
+        Names of the stations
+    date : datetime
+        The date of the measurement
+    component : str
+        Component code
+    filterid : int
+        Filter ID
+    mov_stack : int or str
+        Moving stack value
+    taxis : numpy.ndarray
+        Time axis
+    dvv, err, coh : numpy.ndarray
+        The dv/v values, errors, and coherence values
+    freqs : numpy.ndarray
+        Frequency values
+    inx : tuple
+        Indices of valid frequencies
+        
+    Returns:
+    -------
+    str
+        Path to the saved file
+    """
+    # Format filterid with leading zeros (e.g., 1 -> "01")
+    filter_str = f"{int(filterid):02d}"
+    
+    # Format mov_stack (could be string like '10d_1d' or int)
+    if isinstance(mov_stack, (list, tuple)):
+        mov_stack_str = '_'.join(str(m) for m in mov_stack)
+    else:
+        mov_stack_str = str(mov_stack)
+    
+    # Station pair string
+    pair_str = f"{station1}_{station2}"
+    
+    # Create directory structure
+    # WCT/[filter_id]/[mov_stack]/[component]/[station_pair]/
+    dir_path = os.path.join('WCT', filter_str, mov_stack_str, component, pair_str)
+    os.makedirs(dir_path, exist_ok=True)
+    
+    # Filename is just the date: YYYY-MM-DD.npz
+    date_str = date.strftime('%Y-%m-%d')
+    filename = f"{date_str}.npz"
+    filepath = os.path.join(dir_path, filename)
+    
+    # Create DataFrames
+    freqs_subset = freqs[inx]
+    
+    # Save to numpy compressed format
+    np.savez_compressed(
+        filepath,
+        date=date,
+        freqs=freqs_subset,
+        dvv=dvv,
+        err=err,
+        coh=coh,
+        taxis=taxis,
+        station1=station1,
+        station2=station2,
+        component=component,
+        filterid=filterid,
+        mov_stack=mov_stack
+    )
+    
+    logger.debug(f"Saved WCT results to {filepath}")
+    return filepath
+    
+def process_wct_job(pair, day, params, taxis, filters):
+    """
+    Process a single WCT job without database access.
+    
+    Parameters:
+    ----------
+    job_data : dict
+        Dictionary with job information (ref, pair, day, flag)
+    params : dict-like
+        Configuration parameters
+    taxis : numpy.ndarray
+        Time axis
+    filters : list
+        List of filters to use
+        
+    Returns:
+    -------
+    bool
+        True if job was successfully processed, False otherwise
+    """
+    # Parse pair and day
+    station1, station2 = pair.split(":")
+    
+    # Determine components to compute
+    if station1 == station2:
+        components_to_compute = params.components_to_compute_single_station
+    else:
+        components_to_compute = params.components_to_compute
+        
+    logger.info(f"Processing Pair: {pair}, Day: {day} for {len(filters)} filters, {len(components_to_compute)} components and {len(params.mov_stack)} moving windows")
+    
+    # Extract parameters
+    ns = params.wct_ns
+    nt = params.wct_nt 
+    vpo = params.wct_vpo 
+    nptsfreq = params.wct_nptsfreq
+    coda_cycles = params.dtt_codacycles 
+    min_nonzero = params.dvv_min_nonzero
+    wct_norm = params.wct_norm
+    wavelet_type = params.wavelet_type
+    
+    mov_stacks = params.mov_stack
+    goal_sampling_rate = params.cc_sampling_rate
+    lag_min = params.dtt_minlag
+    maxdt = params.dtt_maxdt
+    mincoh = params.dtt_mincoh
+        
+    # Convert date string to datetime
+    try:
+        date = pd.to_datetime(day)
+    except:
+        logger.error(f"Failed to parse date: {day}")
+        return False
+    
+    operations_succeeded = 0  # Track if all operations for this job succeed
+
+    # Process each filter
+    for f in filters:
+        filterid = int(f['ref'])
+        freqmin = f['low']
+        freqmax = f['high']
+        
+        # Process each component
+        for component in components_to_compute:
+            try:
+                # Get reference waveform
+                ref = xr_get_ref(station1, station2, component, filterid, taxis, ignore_network=True)
+                ref = ref.CCF.values
+                if wct_norm:
+                    ori_waveform = (ref/ref.max()) 
+                else:
+                    ori_waveform = ref
+            except FileNotFoundError as fullpath:
+                logger.error(f"FILE DOES NOT EXIST: {fullpath}, skipping")
+                continue
+            except Exception as e:
+                logger.error(f"Error getting reference waveform: {str(e)}")
+                continue
+            
+            if not len(ref):
+                logger.warning(f"Empty reference waveform for {station1}:{station2} {component} f{filterid}")
+                continue
+            
+            # Process each moving stack
+            for mov_stack in mov_stacks:
+                try:
+                    # Get the data for this day and moving stack
+                    data = xr_get_ccf(station1, station2, component, filterid, mov_stack, taxis)
+                    
+                    # Filter data to get only this specific day
+                    day_data = data[data.index == date]
+                    
+                    if day_data.empty:
+                        logger.warning(f"No data for {date} in {station1}:{station2} {component} f{filterid} m{mov_stack}")
+                        continue
+                    
+                    logger.debug(f"Processing {station1}:{station2} {component} f{filterid} m{mov_stack} - {date}")
+                    
+                    # Get the waveform for this day
+                    waveform = day_data.iloc[0].values
+                    if wct_norm:
+                        new_waveform = (waveform/waveform.max()) 
+                    else:
+                        new_waveform = waveform
+                    
+                    # Calculate wavelet coherence transform
+                    WXamp, WXspec, WXangle, Wcoh, WXdt, freqs, coi = xwt(
+                        ori_waveform, new_waveform, goal_sampling_rate, 
+                        int(ns), float(nt), int(vpo), 
+                        freqmin, freqmax, int(nptsfreq), wavelet_type, maxdt
+                    )
+                    
+                    # Compute dv/v values
+                    dvv, err, wf = compute_wct_dvv(
+                        freqs, taxis, WXamp, Wcoh, WXdt, 
+                        lag_min=int(lag_min), coda_cycles=coda_cycles, 
+                        mincoh=mincoh, maxdt=maxdt, min_nonzero=min_nonzero, 
+                        freqmin=freqmin, freqmax=freqmax
+                    )
+                    
+                    # Calculate average coherence
+                    coh = get_avgcoh(
+                        freqs, taxis, Wcoh, freqmin, freqmax, 
+                        lag_min=int(lag_min), coda_cycles=coda_cycles
+                    )
+                    
+                    # Get frequency indices
+                    inx = np.where((freqs >= freqmin) & (freqs <= freqmax))
+                    
+                    # Save results for this day
+                    save_day_wct_results(
+                        station1, station2, date, component, 
+                        filterid, mov_stack, taxis, 
+                        dvv, err, coh, freqs, inx
+                    )
+                    
+                    operations_succeeded += 1
+                
+                except Exception as e:
+                    logger.error(f"Error processing {component} f{filterid} m{mov_stack}: {str(e)}")
+                    continue
+    
+    # Determine overall success status
+    if operations_succeeded == 0:
+        logger.error(f"Job failed completely: {pair} - {day}.")
+        return False
+    else:
+        logger.info(f"Job processing complete: {pair} - {day}. {operations_succeeded} operations succeeded.")
+        return True
+
+def claim_available_jobs(db, batch_size=5, max_attempts=3):
+    """
+    Claims a batch of available jobs
+    
+    Parameters:
+    ----------
+    db : Session
+        Database session
+    batch_size : int
+        Maximum number of jobs to claim at once
+    max_attempts : int
+        Number of retries if no jobs found
+        
+    Returns:
+    -------
+    list
+        List of claimed Job objects
+    """
+    from sqlalchemy import text
+    import time
+        
+    for attempt in range(max_attempts):
+        try:
+            # Make sure we're not in a transaction already
+            if db.in_transaction():
+                db.rollback()
+            
+            # Find available jobs
+            available_jobs = db.query(Job).filter(
+                Job.flag == 'T',
+                Job.jobtype == 'WCT',
+                Job.day != 'REF'
+            ).limit(batch_size).all()
+            
+            if not available_jobs:
+                if attempt < max_attempts - 1:
+                    time.sleep(1 * (attempt + 1))
+                    continue
+                else:
+                    logger.info("No jobs available after {max_attempts} retries")
+                    return []
+            
+            # Make a copy of the job data before updating
+            jobs = []
+            job_ids = []
+            
+            for job in available_jobs:
+                # Properly create job copies with all required attributes
+                job_copy = Job(
+                    day=job.day,
+                    pair=job.pair,
+                    jobtype=job.jobtype,
+                    flag='I'
+                )
+                job_copy.ref = job.ref
+                jobs.append(job_copy)
+                job_ids.append(job.ref)
+            
+            # Start a transaction for the update
+            if db.in_transaction():
+                db.rollback()
+            db.begin()
+            
+            # Update the jobs to mark them as in progress
+            update_query = text("""
+                UPDATE jobs
+                SET flag = 'I', lastmod = NOW()
+                WHERE ref IN :job_ids
+                AND flag = 'T'  -- Double-check it hasn't been claimed
+            """)
+            
+            result = db.execute(update_query, {'job_ids': tuple(job_ids)})
+            updated_count = result.rowcount
+            
+            # Commit the transaction
+            db.commit()
+            
+            # Check if we actually updated anything (race condition check)
+            if updated_count > 0:
+                # Only return jobs that were actually updated
+                return jobs[:updated_count]
+            else:
+                if attempt < max_attempts - 1:
+                    time.sleep(1 * (attempt + 1))
+                    continue
+                else:
+                    return []
+                
+        except Exception as e:
+            if db.in_transaction():
+                db.rollback()
+            logger.error(f"Error claiming jobs: {str(e)}")
+            time.sleep(1)
+    
+    return []
+    
+def main(loglevel="INFO", batch_size=5):
+    """
+    Main function to process WCT jobs using day job distribution approach
+    """
     # Reconfigure logger to show the pid number in log records
     global logger
     logger = get_logger('msnoise.compute_wct_child', loglevel,
                         with_pid=True)
     logger.info('*** Starting: Compute WCT ***')
+    time.sleep(np.random.random() * 2)
+    
+    try:
+        db = connect()
+        
+        # Ensure no lingering transactions
+        if hasattr(db, 'in_transaction') and db.in_transaction():
+            db.rollback()
+            
+        params = get_params(db)
+        taxis = get_t_axis(db)
+        filters = get_filters(db, all=False)
+        
+        # Convert filters to dictionaries before closing the session
+        filter_dicts = []
+        for f in filters:
+            filter_dicts.append({
+                'ref': f.ref,
+                'low': f.low,
+                'high': f.high,
+                'mwcs_low': getattr(f, 'mwcs_low', None),
+                'mwcs_high': getattr(f, 'mwcs_high', None),
+                'rms_threshold': getattr(f, 'rms_threshold', None),
+                'mwcs_wlen': getattr(f, 'mwcs_wlen', None),
+                'mwcs_step': getattr(f, 'mwcs_step', None)
+            })
+        db.close()
 
-    db = connect()
-    params = get_params(db)
-    taxis = get_t_axis(db)
-
-    mov_stacks = params.mov_stack
-    goal_sampling_rate = params.cc_sampling_rate
-
-    logger.debug('Ready to compute')
-    # Then we compute the jobs
-    #filters = get_filters(db, all=False)
-
-    # Fetch all WCT and DTT parameter sets
-    dvv_wct_params = get_dvv_wct_jobs(db, all=False)
-    wct_dtt_params = get_dvv_wct_dtt_jobs(db, all=False)
-
-    time.sleep(np.random.random() * 5)
-
-    while is_dtt_next_job(db, flag='T', jobtype='WCT'):
-        # TODO would it be possible to make the next 8 lines in the API ?
-        jobs = get_dtt_next_job(db, flag='T', jobtype='WCT')
-
-        if not len(jobs):
-            # edge case, should only occur when is_next returns true, but
-            # get_next receives no jobs (heavily parallelised calls).
-            time.sleep(np.random.random())
-            continue
-        pair = jobs[0].pair
-        refs, days = zip(*[[job.ref, job.day] for job in jobs])
-
-        logger.info(
-            "There are WCT jobs for some days to recompute for %s" % pair)
-        for filter_ref, wct_list in dvv_wct_params.items():
-            filterid = int(filter_ref)  
-            filt_components, filt_components_single_station = get_filter_components_to_compute(db, filterid, params)
-            for wct_params in wct_list:
-                wctid = int(wct_params.ref)
-                freqmin = wct_params.wct_freqmin
-                freqmax = wct_params.wct_freqmax
-
-                ns = wct_params.wct_ns
-                nt = wct_params.wct_nt 
-                vpo = wct_params.wct_vpo 
-                nptsfreq = wct_params.wct_nptsfreq
-                wct_norm = wct_params.wct_norm
-                wavelet_type = wct_params.wavelet_type
-
-                if isinstance(wavelet_type, str):  # If it's stored as a string, convert it
-                    try:
-                        wavelet_type = eval(wavelet_type, {"__builtins__": {}})
-                    except (SyntaxError, NameError):
-                        wavelet_type = None
-
-                station1, station2 = pair.split(":")
-                if station1 == station2:
-                    components_to_compute = filt_components_single_station
-                else:
-                    components_to_compute = filt_components
-
-                for dtt_params in wct_dtt_params[filterid][wctid]:
-                    dttid = int(dtt_params.ref)
-
-                    freqmin = dtt_params.wct_dtt_freqmin
-                    freqmax = dtt_params.wct_dtt_freqmax
-                    coda_cycles = dtt_params.wct_codacycles 
-                    min_nonzero = dtt_params.wct_min_nonzero
-                    lag_min = dtt_params.wct_minlag
-                    maxdt = dtt_params.wct_maxdt
-                    mincoh = dtt_params.wct_mincoh
-
-                    for components in components_to_compute:
-                        try:
-                            ref = xr_get_ref(station1, station2, components, filterid, taxis)
-                            ref = ref.CCF.values
-                            if wct_norm:
-                                ori_waveform = (ref/ref.max()) 
-                            else:
-                                ori_waveform = ref
-                        except FileNotFoundError as fullpath:
-                            logger.error("FILE DOES NOT EXIST: %s, skipping" % fullpath)
-                            continue
-                        if not len(ref):
-                            continue
-
-                        for mov_stack in mov_stacks:
-                            try:
-                                data = xr_get_ccf(station1, station2, components, filterid, mov_stack, taxis)
-                            except FileNotFoundError as fullpath:
-                                logger.error("FILE DOES NOT EXIST: %s, skipping" % fullpath)
-                                continue
-                            logger.debug("Processing %s:%s f%i m%s %s" % (station1, station2, filterid, mov_stack, components))
-
-                            to_search = pd.to_datetime(days)
-                            to_search = to_search.append(pd.DatetimeIndex([to_search[-1]+pd.Timedelta("1d"),]))
-                            data = data[data.index.floor('d').isin(to_search)]
-                            data = data.dropna()
-
-                            cur = data#.CCF.values
-                            if wct_norm:
-                                new_waveform = (cur/cur.max()) 
-                            else:
-                                new_waveform = cur
-
-                            dvv_list, err_list, coh_list, dates_list = [], [], [], []
-
-                            for date, row in new_waveform.iterrows():
-                                WXamp, WXspec, WXangle, WXcoh, WXdt, freqs, coi = xwt(ori_waveform, row.values, goal_sampling_rate, int(ns), int(nt), int(vpo), freqmin, freqmax, int(nptsfreq), wavelet_type)
+        # Process jobs in batches to avoid too many database connections
+        jobs_processed = 0
+        max_jobs_per_process = 1000  # Safety limit
+        consecutive_empty_batches = 0
+        max_consecutive_empty = 3  # Exit after this many empty batches
+        
+        while jobs_processed < max_jobs_per_process:
+            # Connect to the database and get a batch of jobs
+            db = connect()
+            
+            # Ensure no lingering transactions
+            if hasattr(db, 'in_transaction') and db.in_transaction():
+                db.rollback()
+            
+            # Check if there are any jobs left
+            job_exists = is_dtt_next_job(db, flag='T', jobtype='WCT')
+            if not job_exists:
+                logger.info("No more WCT jobs to process")
+                db.close()
+                break
+                
+            # Try to claim a batch of jobs
+            jobs = claim_available_jobs(db, batch_size)
+            db.close()
+            
+            if not jobs:
+                consecutive_empty_batches += 1
+                if consecutive_empty_batches >= max_consecutive_empty:
+                    logger.info(f"Exiting after {consecutive_empty_batches} empty batches")
+                    break
+                time.sleep(2)  # Wait before next attempt
+                continue
+            else:
+                consecutive_empty_batches = 0  # Reset counter when we get jobs
+                
+            # Process each job in the batch
+            for job in jobs:
+                pair = job.pair
+                day = job.day
+                
+                # Process this job
+                success = process_wct_job(pair, day, params, taxis, filter_dicts)
                                 
-                                dvv, err, _ = compute_wct_dvv(freqs, taxis, WXamp, WXcoh, WXdt, 
-                                                              lag_min=int(lag_min), coda_cycles=coda_cycles, 
-                                                              mincoh=mincoh, maxdt=maxdt, min_nonzero=min_nonzero, 
-                                                              freqmin=freqmin, freqmax=freqmax)
-
-                                coh = get_avgcoh(freqs, taxis, WXcoh, freqmin, freqmax, lag_min=int(lag_min), coda_cycles=coda_cycles)
-
-                                dvv_list.append(dvv)
-                                err_list.append(err)
-                                coh_list.append(coh)
-                                dates_list.append(date)
-
-                            if len(dvv_list) > 0:
-                                dvv_df = pd.DataFrame(dvv_list, columns=freqs, index=dates_list)
-                                err_df = pd.DataFrame(err_list, columns=freqs, index=dates_list)
-                                coh_df = pd.DataFrame(coh_list, columns=freqs, index=dates_list)
-                            
-                                xr_save_wct_dtt2(station1, station2, components, filterid, wctid, dttid, mov_stack, taxis, dvv_df, err_df, coh_df)
-
-
-        massive_update_job(db, jobs, "D")
-
+                # Update job status
+                db = connect()
+                if success:
+                    update_job(db, day, pair, 'WCT', 'D')
+                else:
+                    update_job(db, day, pair, 'WCT', 'E')  # Mark as error
+                db.close()
+                
+                jobs_processed += 1 
+                
+            # Small delay between batches
+            time.sleep(0.5)
+            
+        logger.info(f"Process completed {jobs_processed} jobs")
+                        
+    except Exception as e:
+        logger.error(f"Error in main processing: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+    finally:
+        # Final cleanup
+        try:
+            if 'db' in locals() and db is not None:
+                # Ensure we don't leave transactions open
+                if hasattr(db, 'in_transaction') and db.in_transaction():
+                    db.rollback()
+                db.close()
+        except:
+            pass
     logger.info('*** Finished: Compute WCT ***')
 
 if __name__ == "__main__":
